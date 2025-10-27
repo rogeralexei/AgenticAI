@@ -8,7 +8,7 @@ venv/
 env/
 ENV/
 .venv
-./projects_db.json
+projects_db.json
 
 # Environment variables
 .env

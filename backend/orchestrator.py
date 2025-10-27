@@ -301,14 +301,26 @@ async def generate_app(request: GenerateAppRequest):
         schema_code = schema_code.replace('(Base())', '(Base)')
         (project_dir / "schema.py").write_text(schema_code)
         
-        # Generate API code
+        # Generate API code with proper imports
         entity_lower = re.sub(r'(?<!^)(?=[A-Z])', '_', request.schema.entityName).lower()
+        
+        # Create form fields for POST endpoint
+        form_fields = []
+        for field in request.schema.fields:
+            if field.name != "id":  # Skip ID field
+                field_type = "str" if field.type in ["string", "email", "text"] else "int" if field.type == "number" else "bool"
+                form_fields.append(f"{field.name}: {field_type} = Form(...)")
+        
+        form_params = ", ".join(form_fields)
+        field_assignments = "\n    ".join([f'{field.name}={field.name},' for field in request.schema.fields if field.name != "id"])
         
         api_code = f"""from fastapi import FastAPI, HTTPException, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine
-from .schema import Base, {request.schema.entityName}
+from pydantic import BaseModel
+from typing import List, Optional
+import schema
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./app.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={{"check_same_thread": False}})
@@ -331,57 +343,399 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-Base.metadata.create_all(bind=engine)
+# Create tables
+schema.Base.metadata.create_all(bind=engine)
+
+@app.get("/")
+async def root():
+    return {{"message": "Welcome to {request.schema.entityName} API", "endpoints": ["GET /{entity_lower}/", "POST /{entity_lower}/", "DELETE /{entity_lower}/{{id}}"]}}
 
 @app.post("/{entity_lower}/")
-async def create_{entity_lower}(db: Session = Depends(get_db)):
-    # Implementation here
-    pass
+async def create_{entity_lower}({form_params}, db: Session = Depends(get_db)):
+    try:
+        new_item = schema.{request.schema.entityName}(
+            {field_assignments}
+        )
+        db.add(new_item)
+        db.commit()
+        db.refresh(new_item)
+        return {{"message": "Created successfully", "id": new_item.id}}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/{entity_lower}/")
 async def read_{entity_lower}s(db: Session = Depends(get_db)):
-    return db.query({request.schema.entityName}).all()
+    items = db.query(schema.{request.schema.entityName}).all()
+    return {{"count": len(items), "items": items}}
+
+@app.get("/{entity_lower}/{{item_id}}")
+async def read_{entity_lower}(item_id: int, db: Session = Depends(get_db)):
+    item = db.query(schema.{request.schema.entityName}).filter(schema.{request.schema.entityName}.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return item
 
 @app.delete("/{entity_lower}/{{item_id}}")
 async def delete_{entity_lower}(item_id: int, db: Session = Depends(get_db)):
-    item = db.query({request.schema.entityName}).filter({request.schema.entityName}.id == item_id).first()
+    item = db.query(schema.{request.schema.entityName}).filter(schema.{request.schema.entityName}.id == item_id).first()
     if not item:
-        raise HTTPException(status_code=404)
+        raise HTTPException(status_code=404, detail="Item not found")
     db.delete(item)
     db.commit()
-    return {{"message": "Deleted"}}
+    return {{"message": "Deleted successfully", "id": item_id}}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 """
         
         (project_dir / "api.py").write_text(api_code)
         
-        # Generate frontend.py
-        frontend_code = f"""from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+        # Generate frontend.py with working interface
+        frontend_code = f"""from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import create_engine
 from pathlib import Path
+import schema
 
 app = FastAPI(title="{request.schema.entityName} Frontend")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
+# Database setup
+SQLALCHEMY_DATABASE_URL = "sqlite:///./app.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={{"check_same_thread": False}})
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        return db
+    finally:
+        db.close()
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    return templates.TemplateResponse("index.html", {{"request": request, "title": "{request.schema.entityName}"}})
+    db = get_db()
+    items = db.query(schema.{request.schema.entityName}).all()
+    return templates.TemplateResponse("index.html", {{
+        "request": request, 
+        "title": "{request.schema.entityName}",
+        "items": items
+    }})
+
+@app.post("/create")
+async def create_item(request: Request):
+    db = get_db()
+    form_data = await request.form()
+    
+    try:
+        new_item = schema.{request.schema.entityName}(
+            **{{k: v for k, v in form_data.items() if k != "id"}}
+        )
+        db.add(new_item)
+        db.commit()
+        return RedirectResponse(url="/", status_code=303)
+    except Exception as e:
+        return templates.TemplateResponse("index.html", {{
+            "request": request,
+            "title": "{request.schema.entityName}",
+            "error": str(e),
+            "items": db.query(schema.{request.schema.entityName}).all()
+        }})
+
+@app.post("/delete/{{item_id}}")
+async def delete_item(item_id: int):
+    db = get_db()
+    item = db.query(schema.{request.schema.entityName}).filter(schema.{request.schema.entityName}.id == item_id).first()
+    if item:
+        db.delete(item)
+        db.commit()
+    return RedirectResponse(url="/", status_code=303)
+
+if __name__ == "__main__":
+    import uvicorn
+    schema.Base.metadata.create_all(bind=engine)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
 """
         (project_dir / "frontend.py").write_text(frontend_code)
         
-        # Generate index.html template
+        # Generate index.html template with full CRUD interface
+        field_inputs = []
+        for field in request.schema.fields:
+            if field.name != "id":
+                input_type = "text"
+                if field.type == "number":
+                    input_type = "number"
+                elif field.type == "email":
+                    input_type = "email"
+                elif field.type == "date":
+                    input_type = "date"
+                elif field.type == "boolean":
+                    input_type = "checkbox"
+                
+                required = "required" if field.required else ""
+                
+                if field.type == "text":
+                    field_inputs.append(f'''
+            <div class="form-group">
+                <label for="{field.name}">{field.label}:</label>
+                <textarea id="{field.name}" name="{field.name}" rows="3" {required}></textarea>
+            </div>''')
+                elif field.type == "boolean":
+                    field_inputs.append(f'''
+            <div class="form-group checkbox">
+                <label>
+                    <input type="checkbox" id="{field.name}" name="{field.name}" value="true">
+                    {field.label}
+                </label>
+            </div>''')
+                else:
+                    field_inputs.append(f'''
+            <div class="form-group">
+                <label for="{field.name}">{field.label}:</label>
+                <input type="{input_type}" id="{field.name}" name="{field.name}" {required}>
+            </div>''')
+        
+        form_fields = "\n".join(field_inputs)
+        
+        table_headers = "\n                ".join([f'<th>{field.label}</th>' for field in request.schema.fields])
+        table_cells = "\n                    ".join([f'<td>{{{{ item.{field.name} }}}}</td>' for field in request.schema.fields])
+        
         template_html = f"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{{{ title }}}} Manager</title>
     <style>
-        body {{ font-family: Arial, sans-serif; margin: 40px; }}
-        h1 {{ color: #333; }}
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        
+        .header {{
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }}
+        
+        h1 {{
+            color: #333;
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }}
+        
+        .subtitle {{
+            color: #666;
+            font-size: 1rem;
+        }}
+        
+        .card {{
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }}
+        
+        h2 {{
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.5rem;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }}
+        
+        .form-group {{
+            margin-bottom: 20px;
+        }}
+        
+        label {{
+            display: block;
+            margin-bottom: 5px;
+            color: #333;
+            font-weight: 500;
+        }}
+        
+        input[type="text"],
+        input[type="number"],
+        input[type="email"],
+        input[type="date"],
+        textarea {{
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 5px;
+            font-size: 1rem;
+            transition: border-color 0.3s;
+        }}
+        
+        input:focus,
+        textarea:focus {{
+            outline: none;
+            border-color: #667eea;
+        }}
+        
+        .checkbox {{
+            display: flex;
+            align-items: center;
+        }}
+        
+        .checkbox label {{
+            display: flex;
+            align-items: center;
+            margin-bottom: 0;
+        }}
+        
+        .checkbox input {{
+            width: auto;
+            margin-right: 10px;
+        }}
+        
+        button {{
+            background: #667eea;
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 5px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background 0.3s;
+        }}
+        
+        button:hover {{
+            background: #5568d3;
+        }}
+        
+        .btn-delete {{
+            background: #ef4444;
+            padding: 8px 16px;
+            font-size: 0.875rem;
+        }}
+        
+        .btn-delete:hover {{
+            background: #dc2626;
+        }}
+        
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }}
+        
+        th, td {{
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e0e0e0;
+        }}
+        
+        th {{
+            background: #f5f5f5;
+            font-weight: 600;
+            color: #333;
+        }}
+        
+        tr:hover {{
+            background: #f9f9f9;
+        }}
+        
+        .no-data {{
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }}
+        
+        .error {{
+            background: #fee;
+            border: 1px solid #fcc;
+            color: #c33;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }}
+        
+        .success {{
+            background: #efe;
+            border: 1px solid #cfc;
+            color: #3c3;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }}
     </style>
 </head>
 <body>
-    <h1>{{{{ title }}}} Management System</h1>
-    <p>Welcome to your generated application!</p>
+    <div class="container">
+        <div class="header">
+            <h1>{{{{ title }}}} Management System</h1>
+            <p class="subtitle">Create, read, and manage your {{{{ title }}}} records</p>
+        </div>
+        
+        {{% if error %}}
+        <div class="error">
+            <strong>Error:</strong> {{{{ error }}}}
+        </div>
+        {{% endif %}}
+        
+        <div class="card">
+            <h2>Create New {{{{ title }}}}</h2>
+            <form method="post" action="/create">
+                {form_fields}
+                
+                <button type="submit">Create {{{{ title }}}}</button>
+            </form>
+        </div>
+        
+        <div class="card">
+            <h2>All {{{{ title }}}}s</h2>
+            
+            {{% if items %}}
+            <table>
+                <thead>
+                    <tr>
+                        {table_headers}
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{% for item in items %}}
+                    <tr>
+                        {table_cells}
+                        <td>
+                            <form method="post" action="/delete/{{{{ item.id }}}}" style="display: inline;">
+                                <button type="submit" class="btn-delete" onclick="return confirm('Are you sure?')">Delete</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {{% endfor %}}
+                </tbody>
+            </table>
+            {{% else %}}
+            <div class="no-data">
+                <p>No {{{{ title }}}}s found. Create your first one above!</p>
+            </div>
+            {{% endif %}}
+        </div>
+    </div>
 </body>
 </html>
 """
