@@ -746,6 +746,7 @@ if __name__ == "__main__":
 uvicorn[standard]==0.32.0
 sqlalchemy==2.0.36
 jinja2==3.1.4
+python-multipart==0.0.9
 """
         (project_dir / "requirements.txt").write_text(requirements)
         
